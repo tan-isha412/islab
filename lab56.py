@@ -29,7 +29,8 @@
 #    [J] demos / manual answers / self-test
 # =====================================================================================
 import hashlib, hmac, time, json, socket, sys, random, secrets
-from Crypto.PublicKey import RSA
+from Crypto.PublicKey import RSA, ECC
+from Crypto.Signature import DSS
 from Crypto.Signature import pkcs1_15
 from Crypto.Hash import SHA256
 from Crypto.Cipher import AES, PKCS1_OAEP
@@ -327,6 +328,27 @@ def schnorr_sign_fixed_k(message, params, x, k):
 
 
 # =====================================================================================
+# [EX2] ECDSA  -- elliptic-curve digital signature (ECC-based, fills the Lab 6 gap)
+#   smaller keys than RSA for the same security; sign the SHA-256 of the message.
+# =====================================================================================
+def ecdsa_keygen(curve="P-256"):
+    key = ECC.generate(curve=curve)
+    return key.public_key(), key                   # public, private
+
+
+def ecdsa_sign(message, priv_key):
+    return DSS.new(priv_key, "fips-186-3").sign(SHA256.new(message))
+
+
+def ecdsa_verify(message, sig, pub_key):
+    try:
+        DSS.new(pub_key, "fips-186-3").verify(SHA256.new(message), sig)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+# =====================================================================================
 # [H] SOCKETS: integrity client/server (Lab 5 Q2 + additional chunked exercise)
 #   Server: receive data, compute SHA-256, send the hash back.
 #   Client: compute the hash locally and compare -> detects corruption in transit.
@@ -555,6 +577,9 @@ def self_test():
     except PermissionError:
         pass
     assert "COMPLIANCE REPORT" in compliance_report(rec, True, True)
+    epub, epriv = ecdsa_keygen()
+    es = ecdsa_sign(b"ecc signed", epriv)
+    assert ecdsa_verify(b"ecc signed", es, epub) and not ecdsa_verify(b"ecc sign3d", es, epub)
     print("ALL PASSED")
 
 
