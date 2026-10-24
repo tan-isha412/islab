@@ -577,6 +577,136 @@ def des3_ecb_decrypt(key, ct):
 
 
 # =====================================================================================
+# [EX3] EVERY AES/DES/3DES MODE AS AN INDIVIDUAL FUNCTION (no dispatcher, no simulation)
+#   AES key size picks the variant:  16 bytes = AES-128 | 24 = AES-192 | 32 = AES-256.
+#   DES key = 8 bytes.  3DES key = 24 bytes (3 distinct 8-byte parts).
+#   ECB/CBC pad to the block size (16 for AES, 8 for DES/3DES).
+#   CFB/OFB/CTR are stream modes -> NO padding.  CBC/CFB/OFB need a 16/8-byte IV; CTR a nonce.
+# =====================================================================================
+# ---------- AES (pass a 16/24/32-byte key for 128/192/256) ----------
+def aes_ecb_encrypt(key, data):
+    return AES.new(key, AES.MODE_ECB).encrypt(pad(data, 16))
+
+
+def aes_ecb_decrypt(key, ct):
+    return unpad(AES.new(key, AES.MODE_ECB).decrypt(ct), 16)
+
+
+def aes_cbc_enc(key, data, iv):                 # iv = 16 bytes
+    return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(data, 16))
+
+
+def aes_cbc_dec(key, ct, iv):
+    return unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(ct), 16)
+
+
+def aes_cfb_enc(key, data, iv):                 # stream mode, no padding
+    return AES.new(key, AES.MODE_CFB, iv).encrypt(data)
+
+
+def aes_cfb_dec(key, ct, iv):
+    return AES.new(key, AES.MODE_CFB, iv).decrypt(ct)
+
+
+def aes_ofb_enc(key, data, iv):
+    return AES.new(key, AES.MODE_OFB, iv).encrypt(data)
+
+
+def aes_ofb_dec(key, ct, iv):
+    return AES.new(key, AES.MODE_OFB, iv).decrypt(ct)
+
+
+def aes_ctr_enc(key, data, nonce):              # nonce = 8 bytes
+    return AES.new(key, AES.MODE_CTR, nonce=nonce).encrypt(data)
+
+
+def aes_ctr_dec(key, ct, nonce):
+    return AES.new(key, AES.MODE_CTR, nonce=nonce).decrypt(ct)
+
+
+# ---------- DES (key = 8 bytes, block = 8) ----------
+def des_ecb_enc(key, data):
+    return DES.new(key, DES.MODE_ECB).encrypt(pad(data, 8))
+
+
+def des_ecb_dec(key, ct):
+    return unpad(DES.new(key, DES.MODE_ECB).decrypt(ct), 8)
+
+
+def des_cbc_enc(key, data, iv):                 # iv = 8 bytes
+    return DES.new(key, DES.MODE_CBC, iv).encrypt(pad(data, 8))
+
+
+def des_cbc_dec(key, ct, iv):
+    return unpad(DES.new(key, DES.MODE_CBC, iv).decrypt(ct), 8)
+
+
+def des_cfb_enc(key, data, iv):
+    return DES.new(key, DES.MODE_CFB, iv).encrypt(data)
+
+
+def des_cfb_dec(key, ct, iv):
+    return DES.new(key, DES.MODE_CFB, iv).decrypt(ct)
+
+
+def des_ofb_enc(key, data, iv):
+    return DES.new(key, DES.MODE_OFB, iv).encrypt(data)
+
+
+def des_ofb_dec(key, ct, iv):
+    return DES.new(key, DES.MODE_OFB, iv).decrypt(ct)
+
+
+def des_ctr_enc(key, data, nonce):              # nonce = 4 bytes
+    return DES.new(key, DES.MODE_CTR, nonce=nonce).encrypt(data)
+
+
+def des_ctr_dec(key, ct, nonce):
+    return DES.new(key, DES.MODE_CTR, nonce=nonce).decrypt(ct)
+
+
+# ---------- 3DES (key = 24 bytes, block = 8) ----------
+def des3_ecb_enc(key, data):
+    return DES3.new(key, DES3.MODE_ECB).encrypt(pad(data, 8))
+
+
+def des3_ecb_dec(key, ct):
+    return unpad(DES3.new(key, DES3.MODE_ECB).decrypt(ct), 8)
+
+
+def des3_cbc_enc(key, data, iv):
+    return DES3.new(key, DES3.MODE_CBC, iv).encrypt(pad(data, 8))
+
+
+def des3_cbc_dec(key, ct, iv):
+    return unpad(DES3.new(key, DES3.MODE_CBC, iv).decrypt(ct), 8)
+
+
+def des3_cfb_enc(key, data, iv):
+    return DES3.new(key, DES3.MODE_CFB, iv).encrypt(data)
+
+
+def des3_cfb_dec(key, ct, iv):
+    return DES3.new(key, DES3.MODE_CFB, iv).decrypt(ct)
+
+
+def des3_ofb_enc(key, data, iv):
+    return DES3.new(key, DES3.MODE_OFB, iv).encrypt(data)
+
+
+def des3_ofb_dec(key, ct, iv):
+    return DES3.new(key, DES3.MODE_OFB, iv).decrypt(ct)
+
+
+def des3_ctr_enc(key, data, nonce):
+    return DES3.new(key, DES3.MODE_CTR, nonce=nonce).encrypt(data)
+
+
+def des3_ctr_dec(key, ct, nonce):
+    return DES3.new(key, DES3.MODE_CTR, nonce=nonce).decrypt(ct)
+
+
+# =====================================================================================
 # [H] AES FROM SCRATCH (128/192/256) -- for "show all the steps" (manual Lab 2 Q5)
 #   S-box is COMPUTED (inverse in GF(2^8), poly x^8+x^4+x^3+x+1, then affine map),
 #   so there is no 256-entry table to mistype.  state = 4x4 bytes, s[row + 4*col]
@@ -1120,6 +1250,23 @@ def self_test():
     assert des_cbc_decrypt(dk, des_cbc_encrypt(dk, b"classified", div), div) == b"classified"
     import os
     write_text("._t12", "record"); assert read_text("._t12") == "record"; os.remove("._t12")
+    # individual AES/DES/3DES mode functions
+    for ksz, enc, dec in [(16, aes_cbc_enc, aes_cbc_dec), (24, aes_cbc_enc, aes_cbc_dec),
+                          (32, aes_cbc_enc, aes_cbc_dec)]:
+        k, iv = get_random_bytes(ksz), get_random_bytes(16)
+        assert dec(k, enc(k, b"hi aes", iv), iv) == b"hi aes"
+    k16 = get_random_bytes(16)
+    assert aes_ecb_decrypt(k16, aes_ecb_encrypt(k16, b"block")) == b"block"
+    n8 = get_random_bytes(8)
+    assert aes_ctr_dec(k16, aes_ctr_enc(k16, b"stream", n8), n8) == b"stream"
+    iv16 = get_random_bytes(16)
+    assert aes_cfb_dec(k16, aes_cfb_enc(k16, b"cfb msg", iv16), iv16) == b"cfb msg"
+    assert aes_ofb_dec(k16, aes_ofb_enc(k16, b"ofb msg", iv16), iv16) == b"ofb msg"
+    k8 = get_random_bytes(8)
+    assert des_cbc_dec(k8, des_cbc_enc(k8, b"des msg", n8), n8) == b"des msg"
+    assert des_ecb_dec(k8, des_ecb_enc(k8, b"des ecb")) == b"des ecb"
+    k24 = make_key("3DES")
+    assert des3_cbc_dec(k24, des3_cbc_enc(k24, b"3des", n8), n8) == b"3des"
     print("\nALL PASSED")
 
 

@@ -1,40 +1,39 @@
+# =====================================================================================
+#  PRIVACY-PRESERVING E-VOTING SYSTEM   (Officer / Voter / Teller)
+#    Officer : register candidates (each with a Paillier-encrypted tally starting at 0)
+#              and register voters; each candidate record is SHA-256 hashed + ElGamal signed.
+#    Voter   : cast ONE vote for a candidate -> homomorphically add E(1) to that candidate's
+#              tally (the vote is never decrypted); re-sign the updated tally.
+#    Teller  : verify signatures, decrypt ONLY each candidate's final tally, declare winner.
+#
+#  No individual vote is ever decrypted -- only the per-candidate totals.
+#
+#  python prac3.py        -> menu-driven
+#  python prac3.py test   -> self-test (ALL PASSED)
+# =====================================================================================
+import time, json, os, sys, math, random, hashlib
+from Crypto.Util.number import getPrime
 
-import time, json, os, sys, math, secrets, random, hashlib, hmac
-from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
-from Crypto.Util.number import getPrime, GCD
-from Crypto.Util.Padding import pad, unpad
-
-STORE = "readings.json"
-KEYS = "grid_keys.json"
+STORE = "election.json"
+KEYS = "election_keys.json"
 
 
 # =====================================================================================
-# CRYPTO HELPERS
+# HELPERS
 # =====================================================================================
 def timestamp():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def sha256(data):                                  # data is bytes
+def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
 def _hash_int(message, mod):
-    return int(hashlib.sha256(message).hexdigest(), 16) % mod
+    return int(sha256(message), 16) % mod
 
 
-# ---- AES-192 (key = 24 bytes) ----
-def aes192_encrypt(key, data):
-    iv = get_random_bytes(16)
-    return iv, AES.new(key, AES.MODE_CBC, iv).encrypt(pad(data, 16))
-
-
-def aes192_decrypt(key, iv, ct):
-    return unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(ct), 16)
-
-
-# ---- Paillier (additive HE, for the units) ----
+# ---- Paillier (additive HE: the vote tally) ----
 def L(u, n):
     return (u - 1) // n
 
@@ -42,7 +41,7 @@ def L(u, n):
 def paillier_keygen(bits=512):
     while True:
         p, q = getPrime(bits // 2), getPrime(bits // 2)
-        if p != q and GCD(p * q, (p - 1) * (q - 1)) == 1:
+        if p != q and math.gcd(p * q, (p - 1) * (q - 1)) == 1:
             break
     n = p * q
     lam = (p - 1) * (q - 1) // math.gcd(p - 1, q - 1)
@@ -55,7 +54,7 @@ def paillier_encrypt(m, pub):
     n, g = pub
     m %= n
     while True:
-        r = secrets.randbelow(n - 1) + 1
+        r = random.randrange(1, n)
         if math.gcd(r, n) == 1:
             break
     return (pow(g, m, n * n) * pow(r, n, n * n)) % (n * n)
@@ -71,12 +70,12 @@ def paillier_add(c1, c2, pub):                     # E(a)*E(b) -> E(a+b)
     return (c1 * c2) % (n * n)
 
 
-# ---- ElGamal digital signature (the step-up from RSA) ----
+# ---- ElGamal signature (on each candidate tally) ----
 def elgamal_keygen(bits=256):
     p = getPrime(bits)
     g = 2
     x = random.randint(2, p - 2)
-    return (p, g, pow(g, x, p)), x                 # public (p,g,y), private x
+    return (p, g, pow(g, x, p)), x
 
 
 def elgamal_sign(message, p, g, x):
@@ -85,8 +84,7 @@ def elgamal_sign(message, p, g, x):
         if math.gcd(k, p - 1) == 1:
             break
     r = pow(g, k, p)
-    h = _hash_int(message, p)
-    s = ((h - x * r) * pow(k, -1, p - 1)) % (p - 1)
+    s = ((_hash_int(message, p) - x * r) * pow(k, -1, p - 1)) % (p - 1)
     return r, s
 
 
@@ -94,31 +92,17 @@ def elgamal_verify(message, sig, p, g, y):
     r, s = sig
     if not 0 < r < p:
         return False
-    h = _hash_int(message, p)
-    return pow(g, h, p) == (pow(y, r, p) * pow(r, s, p)) % p
-
-
-# ---- deterministic region token (searchable index) ----
-def region_token(index_key, region):
-    return hmac.new(index_key, region.lower().encode(), hashlib.sha256).hexdigest()
-
-
-# =====================================================================================
-# WHAT GETS HASHED / SIGNED  (rebuild identically at verify time)
-#   includes the token too, so tampering with the region/token is also caught
-# =====================================================================================
-def record_payload(rec):
-    return f"{rec['id']}|{rec['region']}|{rec['iv']}|{rec['units']}|{rec['token']}|{rec['timestamp']}".encode()
+    return pow(g, _hash_int(message, p), p) == (pow(y, r, p) * pow(r, s, p)) % p
 
 
 # =====================================================================================
 # RBAC
 # =====================================================================================
-USER_ROLES = {"m": "meter", "b": "billing", "a": "auditor"}
+USER_ROLES = {"off": "officer", "vtr": "voter", "tlr": "teller"}
 ROLE_PERMS = {
-    "meter":   {"add", "view"},
-    "billing": {"sum", "verify", "search"},
-    "auditor": {"verify", "search"},               # NOTE: no decrypt for the auditor
+    "officer": {"register"},
+    "voter":   {"vote"},
+    "teller":  {"tally", "audit"},
 }
 
 
@@ -127,147 +111,138 @@ def can(user, perm):
 
 
 # =====================================================================================
-# PERSISTENT STORE + KEYS
+# STORE  (one dict: candidates {name -> tally record} + voters {id -> {name, voted}})
 # =====================================================================================
-def load_records():
+def load_store():
     if not os.path.exists(STORE):
-        return []
+        return {"candidates": {}, "voters": {}}
     with open(STORE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_records(records):
+def save_store(db):
     with open(STORE, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2)
+        json.dump(db, f, indent=2)
 
 
 def load_or_create_keys():
     if os.path.exists(KEYS):
         with open(KEYS) as f:
             k = json.load(f)
-        return ( bytes.fromhex(k["index_key"]),
-                tuple(k["paill_pub"]), tuple(k["paill_priv"]),
-                tuple(k["eg_pub"]), k["eg_priv"])
-    index_key = get_random_bytes(16)               # for region tokens
+        return tuple(k["paill_pub"]), tuple(k["paill_priv"]), tuple(k["eg_pub"]), k["eg_priv"]
     paill_pub, paill_priv = paillier_keygen(512)
     eg_pub, eg_priv = elgamal_keygen(256)
     with open(KEYS, "w") as f:
-        json.dump({ "index_key": index_key.hex(),
-                   "paill_pub": list(paill_pub), "paill_priv": list(paill_priv),
+        json.dump({"paill_pub": list(paill_pub), "paill_priv": list(paill_priv),
                    "eg_pub": list(eg_pub), "eg_priv": eg_priv}, f)
-    return index_key, paill_pub, paill_priv, eg_pub, eg_priv
+    return paill_pub, paill_priv, eg_pub, eg_priv
+
+
+# what gets hashed/signed for a candidate tally
+def cand_payload(name, rec):
+    return f"{name}|{rec['tally']}".encode()
 
 
 # =====================================================================================
 # ROLE ACTIONS
 # =====================================================================================
-def voter_reg(user,name,pailler_pub):
-    if not can(user, "add"):
-        raise PermissionError(f"{user} may not register")
-    records=load_records()
-    rec={"voterId":len(records)+1,"voterName":name,"voted":False,"voteCnt":paillier_encrypt(1,pailler_pub)}
-    records.append(rec)
-    save_records(records)
-    return rec
-
-def voter_vote(user, id,paill_priv, paill_pub, eg_pub, eg_priv):
-    if not can(user, "add"):
-        raise PermissionError(f"{user} may not add readings")
-    records=load_records()
-    d=None
-    for i,data in enumerate(records,1):
-        if(data["voterId"]==id):
-            if( not data["voted"]):
-                data["voted"]=True
-                data["voteCnt"]=paillier_add(data["voteCnt"],paillier_encrypt(1,paill_pub),paill_pub)
-                d=data
-            else:
-                print("Voter Id",id," has already put their vote down")
-        else:
-            print("Voter ID ",id," doesnt exist")
-    if d is not None:
-        h=sha256(d)
-        sign=elgamal_sign(d,p,g,x)
-        d["hash"]=h
-        d["sign(r)"]=sign
-
-    print(f"[STORED] reading {rec['id']}  token={rec['token'][:12]}...  hash={rec['hash'][:16]}...  {rec['timestamp']}")
-    return rec
+def officer_add_candidate(user, name, paill_pub, eg_pub, eg_priv):
+    if not can(user, "register"):
+        raise PermissionError("not allowed")
+    p, g, _ = eg_pub
+    db = load_store()
+    rec = {"tally": str(paillier_encrypt(0, paill_pub))}        # tally starts at E(0)
+    rec["hash"] = sha256(cand_payload(name, rec))
+    rec["sign"] = elgamal_sign(cand_payload(name, rec), p, g, eg_priv)
+    db["candidates"][name] = rec
+    save_store(db)
+    print(f"[CANDIDATE] {name} registered")
 
 
-def meter_view(user):
-    if not can(user, "view"):
-        raise PermissionError(f"{user} may not view")
-    recs = load_records()
-    print(f"{len(recs)} reading(s):")
-    for r in recs:
-        print(f"  id={r['id']}  region=<AES>  units=<Paillier>  token={r['token'][:12]}...  {r['timestamp']}")
+def officer_reg_voter(user, name):
+    if not can(user, "register"):
+        raise PermissionError("not allowed")
+    db = load_store()
+    vid = str(len(db["voters"]) + 1)
+    db["voters"][vid] = {"name": name, "voted": False}
+    save_store(db)
+    print(f"[VOTER] {name} registered with id {vid}")
+    return vid
 
 
-def _verify(rec, eg_pub):
+def voter_cast(user, voter_id, candidate, paill_pub, eg_pub, eg_priv):
+    if not can(user, "vote"):
+        raise PermissionError("not allowed")
+    p, g, _ = eg_pub
+    db = load_store()
+    voter = db["voters"].get(str(voter_id))
+    if voter is None:
+        print("  no such voter"); return False
+    if voter["voted"]:
+        print(f"  voter {voter_id} has ALREADY voted"); return False
+    if candidate not in db["candidates"]:
+        print("  no such candidate"); return False
+    rec = db["candidates"][candidate]
+    # homomorphically add 1 vote to the candidate's tally (the vote is never decrypted)
+    rec["tally"] = str(paillier_add(int(rec["tally"]), paillier_encrypt(1, paill_pub), paill_pub))
+    rec["hash"] = sha256(cand_payload(candidate, rec))         # re-hash + re-sign the updated tally
+    rec["sign"] = elgamal_sign(cand_payload(candidate, rec), p, g, eg_priv)
+    voter["voted"] = True                                      # stop double voting
+    save_store(db)
+    print(f"  voter {voter_id} voted for {candidate}")
+    return True
+
+
+def _verify(name, rec, eg_pub):
     p, g, y = eg_pub
-    payload = record_payload(rec)
-    hash_ok = sha256(payload) == rec["hash"]       # hash+verify BOTH use SHA-256
-    sig_ok = elgamal_verify(payload, tuple(rec["sign"]), p, g, y)
-    return hash_ok, sig_ok
+    pl = cand_payload(name, rec)
+    return sha256(pl) == rec["hash"], elgamal_verify(pl, tuple(rec["sign"]), p, g, y)
 
 
-def find_by_region(index_key, region):
-    """search by TOKEN -> list of matching records (no decryption needed)"""
-    tok = region_token(index_key, region)
-    return [r for r in load_records() if r["token"] == tok]
-
-
-def billing_sum(user, region, index_key, eg_pub, paill_pub, paill_priv):
-    if not can(user, "sum"):
-        raise PermissionError(f"{user} may not aggregate")
-    matches = find_by_region(index_key, region)
-    enc_total, used = None, []
-    for rec in matches:
-        hash_ok, sig_ok = _verify(rec, eg_pub)         # verify before using
+def teller_tally(user, paill_pub, paill_priv, eg_pub):
+    if not can(user, "tally"):
+        raise PermissionError("not allowed")
+    db = load_store()
+    results = {}
+    for name, rec in db["candidates"].items():
+        hash_ok, sig_ok = _verify(name, rec, eg_pub)
         if not (hash_ok and sig_ok):
-            print(f"  reading {rec['id']} TAMPERED, skipping"); continue
-        c = int(rec["units"])
-        enc_total = c if enc_total is None else paillier_add(enc_total, c, paill_pub)
-        used.append(rec["id"])
-    if enc_total is None:
-        print(f"  no valid readings for region '{region}'"); return None
-    total = paillier_decrypt(enc_total, paill_priv)     # decrypt ONLY the total
-    print(f"  region '{region}' readings {used} -> {total} units -> bill = {total * RATE}")
-    return total
+            print(f"  {name}: TAMPERED tally, skipping"); continue
+        votes = paillier_decrypt(int(rec["tally"]), paill_priv)   # decrypt ONLY the total
+        results[name] = votes
+        print(f"  {name}: {votes} votes")
+    if results:
+        winner = max(results, key=results.get)
+        print(f"  WINNER: {winner} ({results[winner]} votes)")
+    return results
 
 
-def auditor_check(user, region, index_key, eg_pub):
-    if not can(user, "verify"):
-        raise PermissionError(f"{user} may not audit")
-    matches = find_by_region(index_key, region)
-    if not matches:
-        print(f"  no readings for region '{region}'"); return
-    for rec in matches:                                # verify only, NEVER decrypt
-        hash_ok, sig_ok = _verify(rec, eg_pub)
-        verdict = "VALID" if (hash_ok and sig_ok) else "INVALID"
-        print(f"  AUDIT id={rec['id']}: integrity={'PASS' if hash_ok else 'FAIL'}, "
-              f"signature={'VALID' if sig_ok else 'INVALID'} -> {verdict}")
+def teller_audit(user, eg_pub):
+    if not can(user, "audit"):
+        raise PermissionError("not allowed")
+    db = load_store()
+    for name, rec in db["candidates"].items():
+        h, s = _verify(name, rec, eg_pub)
+        print(f"  {name}: {'VALID' if h and s else 'INVALID'}")
 
 
-def tamper(rid):
-    records = load_records()
-    for rec in records:
-        if str(rec["id"]) == str(rid):
-            ct = bytearray(bytes.fromhex(rec["region"])); ct[0] ^= 0xFF
-            rec["region"] = bytes(ct).hex()
-    save_records(records)
-    print(f"[TAMPERED] flipped a byte in reading {rid}")
+def tamper(candidate):
+    db = load_store()
+    if candidate in db["candidates"]:
+        rec = db["candidates"][candidate]
+        rec["tally"] = str(int(rec["tally"]) + 1)              # alter the encrypted tally
+        save_store(db)
+        print(f"[TAMPERED] altered {candidate}'s tally")
 
 
 # =====================================================================================
 # MENU-DRIVEN
 # =====================================================================================
 def menu():
-    aes_key, index_key, paill_pub, paill_priv, eg_pub, eg_priv = load_or_create_keys()
-    print("Smart-Grid Portal. Users: m (meter), b (billing officer), a (auditor)")
+    paill_pub, paill_priv, eg_pub, eg_priv = load_or_create_keys()
+    print("E-Voting. Users: off (officer), vtr (voter), tlr (teller)")
     while True:
-        user = input("\nlogin as (m/b/a, or 'quit'): ").strip()
+        user = input("\nlogin as (off/vtr/tlr, or 'quit'): ").strip()
         if user == "quit":
             break
         role = USER_ROLES.get(user)
@@ -275,38 +250,40 @@ def menu():
             print("unknown user"); continue
         print(f"--- {user} : {role} ---")
 
-        if role == "meter":
+        if role == "officer":
             while True:
-                print("1. add reading   2. view all   3. tamper a reading   0. logout")
+                print("1. add candidate   2. register voter   3. tamper a tally   0. logout")
                 c = input("choice: ").strip()
                 if c == "0":
                     break
                 elif c == "1":
-                    region = input("Region: ")
-                    units = int(input("Units consumed: "))
-                    meter_add(user, region, units, aes_key, index_key, paill_pub, eg_pub, eg_priv)
+                    officer_add_candidate(user, input("candidate name: "), paill_pub, eg_pub, eg_priv)
                 elif c == "2":
-                    meter_view(user)
+                    officer_reg_voter(user, input("voter name: "))
                 elif c == "3":
-                    tamper(input("reading id to tamper: "))
+                    tamper(input("candidate to tamper: "))
 
-        elif role == "billing":
+        elif role == "voter":
             while True:
-                print("1. bill a region (verify + sum + decrypt total)   0. logout")
+                print("1. cast vote   0. logout")
                 c = input("choice: ").strip()
                 if c == "0":
                     break
                 elif c == "1":
-                    billing_sum(user, input("Region: "), index_key, eg_pub, paill_pub, paill_priv)
+                    vid = input("your voter id: ")
+                    cand = input("candidate: ")
+                    voter_cast(user, vid, cand, paill_pub, eg_pub, eg_priv)
 
-        elif role == "auditor":
+        elif role == "teller":
             while True:
-                print("1. audit a region (verify only)   0. logout")
+                print("1. tally + winner   2. audit signatures   0. logout")
                 c = input("choice: ").strip()
                 if c == "0":
                     break
                 elif c == "1":
-                    auditor_check(user, input("Region: "), index_key, eg_pub)
+                    teller_tally(user, paill_pub, paill_priv, eg_pub)
+                elif c == "2":
+                    teller_audit(user, eg_pub)
 
 
 # =====================================================================================
@@ -314,40 +291,38 @@ def menu():
 # =====================================================================================
 def self_test():
     global STORE, KEYS
-    STORE, KEYS = "._grid_test.json", "._gridkeys_test.json"
+    STORE, KEYS = "._elec_test.json", "._ek_test.json"
     for f in (STORE, KEYS):
         if os.path.exists(f):
             os.remove(f)
-    aes_key, index_key, paill_pub, paill_priv, eg_pub, eg_priv = load_or_create_keys()
+    paill_pub, paill_priv, eg_pub, eg_priv = load_or_create_keys()
 
-    meter_add("m", "North", 120, aes_key, index_key, paill_pub, eg_pub, eg_priv)
-    meter_add("m", "North", 90, aes_key, index_key, paill_pub, eg_pub, eg_priv)
-    meter_add("m", "South", 200, aes_key, index_key, paill_pub, eg_pub, eg_priv)
-    meter_add("m", "North", 150, aes_key, index_key, paill_pub, eg_pub, eg_priv)
+    officer_add_candidate("off", "Alice", paill_pub, eg_pub, eg_priv)
+    officer_add_candidate("off", "Bob", paill_pub, eg_pub, eg_priv)
+    for name in ("V1", "V2", "V3"):
+        officer_reg_voter("off", name)
 
-    # all genuine
-    assert all(_verify(r, eg_pub) == (True, True) for r in load_records())
+    assert voter_cast("vtr", "1", "Alice", paill_pub, eg_pub, eg_priv)
+    assert voter_cast("vtr", "2", "Alice", paill_pub, eg_pub, eg_priv)
+    assert voter_cast("vtr", "3", "Bob", paill_pub, eg_pub, eg_priv)
+    # double vote rejected
+    assert not voter_cast("vtr", "1", "Bob", paill_pub, eg_pub, eg_priv)
 
-    # billing: North = 120+90+150 = 360, South = 200
-    assert billing_sum("b", "North", index_key, eg_pub, paill_pub, paill_priv) == 360
-    assert billing_sum("b", "South", index_key, eg_pub, paill_pub, paill_priv) == 200
+    res = teller_tally("tlr", paill_pub, paill_priv, eg_pub)
+    assert res == {"Alice": 2, "Bob": 1}
 
-    # RBAC: auditor cannot sum, meter cannot audit
-    for bad in [lambda: billing_sum("a", "North", index_key, eg_pub, paill_pub, paill_priv),
-                lambda: auditor_check("m", "North", index_key, eg_pub)]:
+    # RBAC: voter cannot tally, officer cannot vote
+    for bad in [lambda: teller_tally("vtr", paill_pub, paill_priv, eg_pub),
+                lambda: voter_cast("off", "1", "Alice", paill_pub, eg_pub, eg_priv)]:
         try:
             bad(); raise AssertionError("RBAC not enforced")
         except PermissionError:
             pass
 
-    # tamper reading 4 (North) -> excluded -> North total drops to 210
-    tamper("4")
-    assert _verify(load_records()[3], eg_pub) == (False, False)
-    assert billing_sum("b", "North", index_key, eg_pub, paill_pub, paill_priv) == 210
-
-    # keys persist
-    aes2, ik2, pp2, ppr2, eg2, egp2 = load_or_create_keys()
-    assert aes2 == aes_key and _verify(load_records()[0], eg2)[1] is True
+    # tamper Alice's tally -> verify fails -> excluded from tally
+    tamper("Alice")
+    name_ok = _verify("Alice", load_store()["candidates"]["Alice"], eg_pub)
+    assert name_ok == (False, False)
 
     for f in (STORE, KEYS):
         os.remove(f)

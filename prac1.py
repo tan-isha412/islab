@@ -309,8 +309,10 @@ def menu():
                     rec = next((r for r in recs if r["id"] == rid), None)
                     if rec:
                         reviewer_verify(user, rec, rsa_pub)
-                elif c=="2":
-
+                elif c == "2":
+                    rid = int(input("record id: "))
+                    rec = next((r for r in load_records() if r["id"] == rid), None)
+                    print(rec if rec else "not found")
 
         elif role == "financialofficer":
             print("1. verify 2.decrypt the amount and the record   0. logout")
@@ -321,7 +323,5 @@ def menu():
                 elif c == "1":
                     for rec in load_records():
                         financialofficer_verify(user,rec,rsa_pub)
-                elif c=="2":
-
-
-
+                elif c == "2":
+                    print("option 2 not implemented in this draft")
